@@ -110,9 +110,9 @@ router.get('/google/callback',
 
       // Redirect to the right dashboard based on role
       const role = req.user.Role;
-      if      (role === 'Admin')      return res.redirect(`${process.env.FRONTEND_URL}/admin`);
-      else if (role === 'Freelancer') return res.redirect(`${process.env.FRONTEND_URL}/freelancer-dashboard`);
-      else                            return res.redirect(`${process.env.FRONTEND_URL}/customer-dashboard`);
+      if      (role === 'Admin')      return res.redirect(`${process.env.FRONTEND_URL}/pages/admin-dashboard.html`);
+else if (role === 'Freelancer') return res.redirect(`${process.env.FRONTEND_URL}/pages/freelancer-dashboard.html`);
+else                            return res.redirect(`${process.env.FRONTEND_URL}/pages/customer-dashboard.html`);
     });
   }
 );
