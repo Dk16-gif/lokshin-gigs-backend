@@ -50,11 +50,13 @@ passport.use(new GoogleStrategy(
 
 // ── SERIALIZE / DESERIALIZE ───────────────────────────────
 passport.serializeUser((user, done) => {
+  if (user.isNew) return done(null, 'new_' + user.googleId);
   done(null, user.UserID);
 });
 
 passport.deserializeUser(async (id, done) => {
   try {
+    if (String(id).startsWith('new_')) return done(null, { isNew: true, googleId: id.replace('new_', '') });
     const [users] = await db.query('SELECT * FROM Users WHERE UserID = ?', [id]);
     done(null, users[0] || null);
   } catch (err) {
