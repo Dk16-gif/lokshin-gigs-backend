@@ -275,5 +275,53 @@ router.post('/reset-password', async (req, res) => {
     res.status(500).json({ success: false, message: `Error: ${err.message}` });
   }
 });
+router.post('/google/complete', async (req, res) => {
+  try {
+    const { fullName, email, phone, role, googleId } = req.body;
 
+    if (!phone || !role)
+      return res.status(400).json({ success: false, message: 'Phone number and role are required.' });
+
+    if (!['Customer','Freelancer'].includes(role))
+      return res.status(400).json({ success: false, message: 'Invalid role.' });
+
+    const [existing] = await db.query('SELECT UserID FROM Users WHERE Email = ?', [email.toLowerCase()]);
+    if (existing.length)
+      return res.status(409).json({ success: false, message: 'Account already exists. Please log in.' });
+
+    const [byPhone] = await db.query('SELECT UserID FROM Users WHERE PhoneNumber = ?', [phone]);
+    if (byPhone.length)
+      return res.status(409).json({ success: false, message: 'Phone number already registered.' });
+
+    const prefix = role === 'Customer' ? 'LG-CUST' : 'LG-FREL';
+    const [[{ total }]] = await db.query('SELECT COUNT(*) AS total FROM Users');
+    const refNumber = `${prefix}-${String(total + 1).padStart(6, '0')}`;
+
+    const [result] = await db.query(
+      `INSERT INTO Users (RefNumber, FullName, Email, Password, PhoneNumber, Role, GoogleID)
+       VALUES (?,?,?,?,?,?,?)`,
+      [refNumber, fullName, email.toLowerCase(), 'GOOGLE_AUTH', phone, role, googleId]
+    );
+
+    if (role === 'Freelancer') {
+      await db.query(
+        'INSERT INTO Freelancers (UserID, SkillCategory, VerificationStatus) VALUES (?,?,?)',
+        [result.insertId, 'General', 'Unverified']
+      );
+    }
+
+    req.session.user = {
+      id: result.insertId, name: fullName,
+      email: email.toLowerCase(), role, refNumber
+    };
+
+    req.session.save(err => {
+      if (err) return res.status(500).json({ success: false, message: 'Session error.' });
+      res.json({ success: true, user: { id: result.insertId, name: fullName, role, refNumber } });
+    });
+
+  } catch (err) {
+    res.status(500).json({ success: false, message: `Error: ${err.message}` });
+  }
+});
 module.exports = router;

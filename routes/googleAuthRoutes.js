@@ -13,58 +13,39 @@ passport.use(new GoogleStrategy(
       ? `${process.env.BACKEND_URL}/api/auth/google/callback`
       : 'http://localhost:3000/api/auth/google/callback'
   },
-  async (accessToken, refreshToken, profile, done) => {
+    async (accessToken, refreshToken, profile, done) => {
     try {
       const email    = profile.emails[0].value;
       const fullName = profile.displayName;
 
-      // Check if user already exists
       const [existing] = await db.query(
         'SELECT * FROM Users WHERE Email = ?',
         [email.toLowerCase()]
       );
 
       if (existing.length) {
-        // User exists — check if active
-        const user = existing[0];
-        if (!user.IsActive)
+        if (!existing[0].IsActive)
           return done(null, false, { message: 'Account suspended.' });
-        return done(null, user);
+        return done(null, { ...existing[0], isNew: false });
       }
 
-      // New user — create account automatically
-      // Google accounts default to Customer role
-      // They can switch to Freelancer later from their profile
-      const [[{ total }]] = await db.query('SELECT COUNT(*) AS total FROM Users');
-      const refNumber = `LG-CUST-${String(total + 1).padStart(6, '0')}`;
-
-      const [result] = await db.query(
-        `INSERT INTO Users
-         (RefNumber, FullName, Email, Password, PhoneNumber, Role, GoogleID)
-         VALUES (?,?,?,?,?,?,?)`,
-        [
-          refNumber,
-          fullName,
-          email.toLowerCase(),
-          'GOOGLE_AUTH',        // no password — they use Google to log in
-          '0000000000',         // placeholder phone — prompt them to update
-          'Customer',
-          profile.id
-        ]
-      );
-
-      const [newUser] = await db.query(
-        'SELECT * FROM Users WHERE UserID = ?',
-        [result.insertId]
-      );
-
-      return done(null, newUser[0]);
+      // New user — don't create yet, collect phone and role first
+      return done(null, {
+        isNew:     true,
+        googleId:  profile.id,
+        FullName:  fullName,
+        Email:     email,
+        Role:      null,
+        UserID:    null,
+        RefNumber: null
+      });
 
     } catch (err) {
       console.error('GOOGLE AUTH ERROR:', err.message);
       return done(err, null);
     }
   }
+    
 ));
 
 // ── SERIALIZE / DESERIALIZE ───────────────────────────────
@@ -94,9 +75,17 @@ router.get('/google',
 // Step 2: Google redirects back here after user approves
 // GET /api/auth/google/callback
 router.get('/google/callback',
-  passport.authenticate('google', { failureRedirect: `${process.env.FRONTEND_URL}/login?error=google_failed` }),
+  passport.authenticate('google', { failureRedirect: `${process.env.FRONTEND_URL}/pages/login.html?error=google_failed` }),
   (req, res) => {
-    // Set our own session so the rest of the app works normally
+    if (req.user.isNew) {
+      const name  = encodeURIComponent(req.user.FullName);
+      const email = encodeURIComponent(req.user.Email);
+      const gid   = encodeURIComponent(req.user.googleId);
+      return res.redirect(
+        `${process.env.FRONTEND_URL}/pages/google-setup.html?name=${name}&email=${email}&gid=${gid}`
+      );
+    }
+
     req.session.user = {
       id:        req.user.UserID,
       name:      req.user.FullName,
@@ -106,13 +95,17 @@ router.get('/google/callback',
     };
 
     req.session.save(err => {
-      if (err) return res.redirect(`${process.env.FRONTEND_URL}/login?error=session_failed`);
-
-      // Redirect to the right dashboard based on role
+      if (err) return res.redirect(`${process.env.FRONTEND_URL}/pages/login.html?error=session_failed`);
       const role = req.user.Role;
-      if      (role === 'Admin')      return res.redirect(`${process.env.FRONTEND_URL}/pages/admin-dashboard.html`);
-else if (role === 'Freelancer') return res.redirect(`${process.env.FRONTEND_URL}/pages/freelancer-dashboard.html`);
-else                            return res.redirect(`${process.env.FRONTEND_URL}/pages/customer-dashboard.html`);
+      const name = encodeURIComponent(req.user.FullName);
+      const id   = req.user.UserID;
+      const ref  = req.user.RefNumber;
+      if (role === 'Admin')
+        return res.redirect(`${process.env.FRONTEND_URL}/pages/admin-dashboard.html?uid=${id}&name=${name}&role=${role}&ref=${ref}`);
+      else if (role === 'Freelancer')
+        return res.redirect(`${process.env.FRONTEND_URL}/pages/freelancer-dashboard.html?uid=${id}&name=${name}&role=${role}&ref=${ref}`);
+      else
+        return res.redirect(`${process.env.FRONTEND_URL}/pages/customer-dashboard.html?uid=${id}&name=${name}&role=${role}&ref=${ref}`);
     });
   }
 );
