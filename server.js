@@ -8,8 +8,16 @@ const cors     = require('cors');
 const app      = express();
 
 // ── CORS ──────────────────────────────────────────────────
+// ADDITIONAL_FRONTEND_ORIGINS: comma-separated exact origins (e.g. Vercel previews).
+// Matched exactly like FRONTEND_URL — no wildcards or patterns.
+const additionalOrigins = (process.env.ADDITIONAL_FRONTEND_ORIGINS || '')
+  .split(',')
+  .map(o => o.trim().replace(/\/+$/, ''))
+  .filter(Boolean);
+
 const allowedOrigins = [
   process.env.FRONTEND_URL,
+  ...additionalOrigins,
   'http://localhost:5173',
   'http://localhost:3000',
 ].filter(Boolean);
