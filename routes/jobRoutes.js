@@ -96,6 +96,12 @@ router.put('/:id/status', requireAuth, async (req, res) => {
 
 router.get('/:id/applications', requireAuth, async (req, res) => {
   try {
+    // Applications include freelancer quotes, so only the job's customer (or an admin) may view them.
+    const [job] = await db.query('SELECT CustomerID FROM Jobs WHERE JobID=?', [req.params.id]);
+    if (!job.length) return res.status(404).json({ success: false, message: 'Job not found.' });
+    const { id: userId, role } = req.session.user;
+    if (role !== 'Admin' && job[0].CustomerID !== userId)
+      return res.status(403).json({ success: false, message: 'Access denied.' });
     const [apps] = await db.query(
       `SELECT a.*, u.FullName AS FreelancerName, u.PhoneNumber, u.RefNumber AS FreelancerRef,
               COALESCE(f.SkillCategory,'General') AS SkillCategory,
@@ -112,22 +118,84 @@ router.get('/:id/applications', requireAuth, async (req, res) => {
 
 router.post('/:id/apply', requireAuth, checkRole('Freelancer'), async (req, res) => {
   try {
-    const { coverNote } = req.body;
-    const [job] = await db.query("SELECT Status FROM Jobs WHERE JobID=?", [req.params.id]);
-    if (!job.length)              return res.status(404).json({ success: false, message: 'Job not found.' });
-    if (job[0].Status !== 'Open') return res.status(400).json({ success: false, message: 'This job is no longer open.' });
+    const { coverNote, quotedPrice } = req.body;
+
+    // Validate the freelancer's quote. Only strings or numbers are accepted (arrays like [100] would otherwise coerce to "100").
+    const quoteText = ['string', 'number'].includes(typeof quotedPrice) ? String(quotedPrice).trim() : '';
+
+    if (!/^\d+(?:\.\d{1,2})?$/.test(quoteText)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Enter a valid quote with no more than two decimal places.'
+      });
+    }
+
+    const quoteAmount = Number(quoteText);
+
+    if (
+      !Number.isFinite(quoteAmount) ||
+      quoteAmount <= 0 ||
+      quoteAmount > 99999999.99
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: 'Your quote must be greater than R0 and within the supported price limit.'
+      });
+    }
+
+    const [job] = await db.query(
+      'SELECT Status FROM Jobs WHERE JobID=?',
+      [req.params.id]
+    );
+
+    if (!job.length) {
+      return res.status(404).json({
+        success: false,
+        message: 'Job not found.'
+      });
+    }
+
+    if (job[0].Status !== 'Open') {
+      return res.status(400).json({
+        success: false,
+        message: 'This job is no longer open.'
+      });
+    }
+
     const [dup] = await db.query(
       'SELECT ApplicationID FROM Applications WHERE JobID=? AND FreelancerID=?',
       [req.params.id, req.session.user.id]
     );
-    if (dup.length) return res.status(409).json({ success: false, message: 'You already applied for this job.' });
+
+    if (dup.length) {
+      return res.status(409).json({
+        success: false,
+        message: 'You already applied for this job.'
+      });
+    }
+
     await db.query(
-      'INSERT INTO Applications (JobID,FreelancerID,CoverNote) VALUES (?,?,?)',
-      [req.params.id, req.session.user.id, coverNote || '']
+      `INSERT INTO Applications
+        (JobID, FreelancerID, CoverNote, QuotedPrice)
+       VALUES (?, ?, ?, ?)`,
+      [
+        req.params.id,
+        req.session.user.id,
+        coverNote || '',
+        quoteAmount
+      ]
     );
-    res.status(201).json({ success: true, message: 'Application submitted successfully!' });
+
+    res.status(201).json({
+      success: true,
+      message: 'Application submitted successfully!'
+    });
   } catch (err) {
-    res.status(500).json({ success: false, message: `Could not apply: ${err.message}` });
+    console.error('APPLICATION SUBMISSION ERROR:', err.message);
+    res.status(500).json({
+      success: false,
+      message: 'Could not submit your application.'
+    });
   }
 });
 

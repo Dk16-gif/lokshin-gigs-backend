@@ -79,6 +79,7 @@ CREATE TABLE IF NOT EXISTS Applications (
   JobID         INT NOT NULL,
   FreelancerID  INT NOT NULL,
   CoverNote     TEXT,
+  QuotedPrice   DECIMAL(10,2) NULL,
   Status        ENUM('Pending','Accepted','Rejected') DEFAULT 'Pending',
   DateApplied   DATETIME DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (JobID)        REFERENCES Jobs(JobID) ON DELETE CASCADE,

@@ -6,7 +6,7 @@ const { requireAuth, checkRole } = require('../middleware/authMiddleware');
 router.get('/my', requireAuth, checkRole('Freelancer'), async (req, res) => {
   try {
     const [applications] = await db.query(
-      `SELECT a.ApplicationID, a.CoverNote, a.Status, a.DateApplied,
+      `SELECT a.ApplicationID, a.CoverNote, a.QuotedPrice, a.Status, a.DateApplied,
               j.JobID, j.Title AS JobTitle, j.Location, j.Budget, j.Status AS JobStatus
        FROM Applications a JOIN Jobs j ON a.JobID=j.JobID
        WHERE a.FreelancerID=? ORDER BY a.DateApplied DESC`,
