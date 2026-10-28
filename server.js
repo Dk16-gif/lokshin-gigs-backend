@@ -54,15 +54,22 @@ app.use(passport.initialize());
 app.use(passport.session());
 
 // ── ROUTES ────────────────────────────────────────────────
+const verificationRoutes = require('./routes/verificationRoutes');
 app.use('/api/auth',         require('./routes/authRoutes'));       // email/password auth
 app.use('/api/auth',         googleAuthRouter);                     // Google OAuth
 app.use('/api/jobs',         require('./routes/jobRoutes'));
 app.use('/api/users',        require('./routes/userRoutes'));
 app.use('/api/reviews',      require('./routes/reviewRoutes'));
+app.use('/api/admin/verifications', verificationRoutes.adminRouter);
 app.use('/api/admin',        require('./routes/adminRoutes'));
 app.use('/api/categories',   require('./routes/categoryRoutes'));
 app.use('/api/applications', require('./routes/applicationRoutes'));
-app.use('/api/verification', require('./routes/verificationRoutes'));
+app.use('/api/verifications', verificationRoutes.router);
+// Retired: the old singular routes allowed document-free submissions and a second review path.
+app.use('/api/verification', (req, res) => res.status(410).json({
+  success: false,
+  message: 'This endpoint has been retired. Use /api/verifications.'
+}));
 app.use('/api/payments',     require('./routes/paymentRoutes'));
 app.use('/api/reports',      require('./routes/reportRoutes'));
 

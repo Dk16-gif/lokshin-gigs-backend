@@ -18,7 +18,8 @@ async function requireAuth(req, res, next) {
           name:      users[0].FullName,
           email:     users[0].Email,
           role:      users[0].Role,
-          refNumber: users[0].RefNumber
+          refNumber: users[0].RefNumber,
+          authSource: 'header'   // unverified — rejected by requireSession
         };
         return next();
       }
@@ -27,6 +28,14 @@ async function requireAuth(req, res, next) {
     }
   }
 
+  return res.status(401).json({ success: false, message: 'Please log in to continue.' });
+}
+
+// Stricter than requireAuth: only a session created by a real login is accepted.
+// The x-user-id header, and any session it created, is never trusted here.
+function requireSession(req, res, next) {
+  const user = req.session?.user;
+  if (user && user.authSource !== 'header') return next();
   return res.status(401).json({ success: false, message: 'Please log in to continue.' });
 }
 
@@ -40,4 +49,4 @@ function checkRole(...roles) {
   };
 }
 
-module.exports = { requireAuth, checkRole };
+module.exports = { requireAuth, requireSession, checkRole };

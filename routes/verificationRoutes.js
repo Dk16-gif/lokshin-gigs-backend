@@ -1,182 +1,302 @@
 const express = require('express');
-const router  = express.Router();
+const crypto  = require('crypto');
+const multer  = require('multer');
+const router      = express.Router();   // /api/verifications
+const adminRouter = express.Router();   // /api/admin/verifications
 const db      = require('../config/db');
-const { requireAuth, checkRole } = require('../middleware/authMiddleware');
+const storage = require('../config/storage');
+const { requireSession, checkRole } = require('../middleware/authMiddleware');
 
-// ── POST /api/verification/submit ────────────────────────
-// Freelancer submits documents for verification
-// In production: integrate with Smile Identity or Onfido for automated KYC
-// For now: manual admin review system
-router.post('/submit', requireAuth, checkRole('Freelancer'), async (req, res) => {
-  try {
-    const {
-      idNumber,          // SA ID number
-      idType,            // 'SA ID', 'Passport', 'Drivers Licence'
-      proofOfAddress,    // description or URL of uploaded document
-      certifications,    // array of certification descriptions
-      yearsExperience
-    } = req.body;
+// Identity documents are sensitive, so every route here needs a real login session.
+// The x-user-id header is never accepted (see requireSession).
 
-    if (!idNumber || !idType)
-      return res.status(400).json({
-        success: false,
-        message: 'ID number and ID type are required for verification.'
-      });
+const MAX_FILE_BYTES = 10 * 1024 * 1024;   // matches the frontend's 10 MB limit
 
-    // Validate SA ID number format (13 digits)
-    if (idType === 'SA ID' && !/^\d{13}$/.test(idNumber))
-      return res.status(400).json({
-        success: false,
-        message: 'SA ID number must be exactly 13 digits.'
-      });
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits:  { fileSize: MAX_FILE_BYTES, files: 2, fields: 4, fieldSize: 1024, parts: 6 }
+}).fields([
+  { name: 'identityDocument',      maxCount: 1 },
+  { name: 'qualificationDocument', maxCount: 1 }
+]);
 
-    // Check if already submitted
-    const [existing] = await db.query(
-      'SELECT VerificationID FROM FreelancerVerifications WHERE UserID = ?',
-      [req.session.user.id]
-    );
+function handleUpload(req, res, next) {
+  upload(req, res, err => {
+    if (!err) return next();
+    const message = err.code === 'LIMIT_FILE_SIZE'
+      ? 'This file is larger than 10 MB. Please upload a smaller file.'
+      : 'Invalid upload. Submit one identity document and at most one qualification document.';
+    res.status(400).json({ success: false, message });
+  });
+}
 
-    if (existing.length) {
-      // Update existing submission
-      await db.query(
-        `UPDATE FreelancerVerifications
-         SET IDNumber=?, IDType=?, ProofOfAddress=?, Certifications=?,
-             YearsExperience=?, Status='Pending', SubmittedAt=NOW()
-         WHERE UserID=?`,
-        [
-          idNumber, idType,
-          proofOfAddress || '',
-          JSON.stringify(certifications || []),
-          yearsExperience || 0,
-          req.session.user.id
-        ]
-      );
-    } else {
-      await db.query(
-        `INSERT INTO FreelancerVerifications
-         (UserID, IDNumber, IDType, ProofOfAddress, Certifications, YearsExperience, Status)
-         VALUES (?,?,?,?,?,?,?)`,
-        [
-          req.session.user.id, idNumber, idType,
-          proofOfAddress || '',
-          JSON.stringify(certifications || []),
-          yearsExperience || 0,
-          'Pending'
-        ]
-      );
-    }
+// File type is decided by the file's leading bytes, never by its name or browser MIME type.
+const SIGNATURES = [
+  { mime: 'application/pdf', ext: 'pdf', bytes: [0x25, 0x50, 0x44, 0x46, 0x2D] },                   // %PDF-
+  { mime: 'image/png',       ext: 'png', bytes: [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A] },
+  { mime: 'image/jpeg',      ext: 'jpg', bytes: [0xFF, 0xD8, 0xFF] }
+];
 
-    // Update freelancer verification status
-    await db.query(
-      "UPDATE Freelancers SET VerificationStatus='Pending' WHERE UserID=?",
-      [req.session.user.id]
-    );
+function detectType(buffer) {
+  return SIGNATURES.find(s => buffer.length > s.bytes.length && s.bytes.every((b, i) => buffer[i] === b)) || null;
+}
 
-    res.json({
-      success: true,
-      message: 'Verification documents submitted. Our team will review within 24-48 hours.'
-    });
+// Display name only — storage keys are random and never derived from it.
+function safeFileName(name, ext) {
+  const base = String(name || '').split(/[\\/]/).pop().replace(/[^\w.\- ()]/g, '_').slice(0, 120).trim();
+  return base || `document.${ext}`;
+}
 
-  } catch (err) {
-    console.error('VERIFICATION ERROR:', err.message);
-    res.status(500).json({ success: false, message: `Could not submit verification: ${err.message}` });
-  }
-});
+// Shared shape for /me and the Admin list (PascalCase, as the frontend expects).
+// Legacy rejected rows recorded their reason in AdminNotes.
+const RECORD_SQL = `
+  SELECT fv.VerificationID, fv.UserID, u.FullName, u.Role,
+         c.CategoryName AS Speciality, fv.CustomSpeciality, fv.Status,
+         COALESCE(fv.RejectionReason, IF(fv.Status='Rejected', NULLIF(fv.AdminNotes,''), NULL)) AS RejectionReason,
+         fv.SubmittedAt, fv.ReviewedAt,
+         idd.OriginalName AS IdentityName, qd.OriginalName AS QualificationName
+  FROM FreelancerVerifications fv
+  JOIN Users u ON u.UserID = fv.UserID
+  LEFT JOIN Categories c ON c.CategoryID = fv.CategoryID
+  LEFT JOIN VerificationDocuments idd ON idd.VerificationID = fv.VerificationID AND idd.Kind = 'Identity'
+  LEFT JOIN VerificationDocuments qd  ON qd.VerificationID  = fv.VerificationID AND qd.Kind  = 'Qualification'`;
 
-// ── GET /api/verification/status ─────────────────────────
-// Freelancer checks their own verification status
-router.get('/status', requireAuth, checkRole('Freelancer'), async (req, res) => {
+function toRecord(row) {
+  const { IdentityName, QualificationName, ...record } = row;
+  return {
+    ...record,
+    IdentityDocument:      IdentityName      ? { name: IdentityName,      available: true } : null,
+    QualificationDocument: QualificationName ? { name: QualificationName, available: true } : null
+  };
+}
+
+// ── GET /api/verifications/me — latest submission, or null when Not Submitted ──
+router.get('/me', requireSession, checkRole('Customer', 'Freelancer'), async (req, res) => {
   try {
     const [rows] = await db.query(
-      `SELECT fv.Status, fv.IDType, fv.SubmittedAt, fv.ReviewedAt, fv.AdminNotes,
-              f.VerificationStatus, f.BackgroundCheckStatus
-       FROM FreelancerVerifications fv
-       JOIN Freelancers f ON f.UserID = fv.UserID
-       WHERE fv.UserID = ?`,
+      `${RECORD_SQL} WHERE fv.UserID=? ORDER BY fv.VerificationID DESC LIMIT 1`,
       [req.session.user.id]
     );
+    res.json({ success: true, verification: rows.length ? toRecord(rows[0]) : null });
+  } catch (err) {
+    console.error('VERIFICATION STATUS ERROR:', err.message);
+    res.status(500).json({ success: false, message: 'Could not load your verification status.' });
+  }
+});
 
-    if (!rows.length) {
-      const [fl] = await db.query(
-        'SELECT VerificationStatus, BackgroundCheckStatus FROM Freelancers WHERE UserID=?',
-        [req.session.user.id]
-      );
-      return res.json({
-        success: true,
-        status: 'Not Submitted',
-        verificationStatus: fl[0]?.VerificationStatus || 'Unverified',
-        backgroundCheck:    fl[0]?.BackgroundCheckStatus || 'Not Started'
+// ── POST /api/verifications — multipart submission ──
+// Customers: identity document only. Freelancers: identity required, plus optional
+// speciality (categoryId or customSpeciality) and optional qualification document.
+router.post('/', requireSession, checkRole('Customer', 'Freelancer'), handleUpload, async (req, res) => {
+  const { id: userId, role } = req.session.user;
+  const identity      = req.files?.identityDocument?.[0];
+  const qualification = req.files?.qualificationDocument?.[0];
+  const categoryText  = String(req.body.categoryId ?? '').trim();
+  const customText    = String(req.body.customSpeciality ?? '').trim().replace(/\s+/g, ' ');
+
+  const reject = message => res.status(400).json({ success: false, message });
+
+  if (!identity) return reject('An identity document is required to submit.');
+  if (role !== 'Freelancer' && (qualification || categoryText || customText))
+    return reject('Only freelancers can submit a speciality or qualification document.');
+  if (categoryText && customText)
+    return reject('Choose a listed speciality or describe your own, not both.');
+  if (categoryText && !/^\d+$/.test(categoryText))
+    return reject('Please choose a valid speciality.');
+  if (customText && (customText.length < 2 || customText.length > 80 || !/^[\p{L}\p{N} &'()+,./-]+$/u.test(customText)))
+    return reject('Describe your speciality in 2-80 characters using letters, numbers and basic punctuation.');
+
+  const files = [{ kind: 'Identity', label: 'identity document', file: identity }];
+  if (qualification) files.push({ kind: 'Qualification', label: 'qualification document', file: qualification });
+  for (const f of files) {
+    f.type = detectType(f.file.buffer);
+    if (!f.type) return reject(`The ${f.label} is not a valid PDF, JPG or PNG file.`);
+  }
+
+  const uploadedKeys = [];
+  let conn;
+  let committed = false;
+  try {
+    let categoryId = null;
+    if (categoryText) {
+      const [cat] = await db.query('SELECT CategoryID FROM Categories WHERE CategoryID=? AND IsActive=1', [categoryText]);
+      if (!cat.length) return reject('Please choose a valid speciality.');
+      categoryId = cat[0].CategoryID;
+    }
+
+    conn = await db.getConnection();
+    await conn.beginTransaction();
+
+    // Lock the user row so two simultaneous submissions cannot both pass the check below.
+    await conn.query('SELECT UserID FROM Users WHERE UserID=? FOR UPDATE', [userId]);
+    const [latest] = await conn.query(
+      'SELECT Status FROM FreelancerVerifications WHERE UserID=? ORDER BY VerificationID DESC LIMIT 1',
+      [userId]
+    );
+    if (latest.length && latest[0].Status !== 'Rejected') {
+      await conn.rollback();
+      return res.status(409).json({
+        success: false,
+        message: latest[0].Status === 'Pending'
+          ? 'Your verification is already pending review.'
+          : 'Your account is already verified.'
       });
     }
 
-    res.json({
-      success:            true,
-      status:             rows[0].Status,
-      idType:             rows[0].IDType,
-      submittedAt:        rows[0].SubmittedAt,
-      reviewedAt:         rows[0].ReviewedAt,
-      adminNotes:         rows[0].AdminNotes,
-      verificationStatus: rows[0].VerificationStatus,
-      backgroundCheck:    rows[0].BackgroundCheckStatus
-    });
-
-  } catch (err) {
-    res.status(500).json({ success: false, message: `Could not get status: ${err.message}` });
-  }
-});
-
-// ── GET /api/verification/pending — admin sees all pending ──
-router.get('/pending', requireAuth, checkRole('Admin'), async (req, res) => {
-  try {
-    const [pending] = await db.query(
-      `SELECT fv.*, u.FullName, u.Email, u.PhoneNumber, u.RefNumber,
-              f.SkillCategory, f.Rating, f.TotalReviews
-       FROM FreelancerVerifications fv
-       JOIN Users u ON fv.UserID = u.UserID
-       JOIN Freelancers f ON f.UserID = fv.UserID
-       WHERE fv.Status = 'Pending'
-       ORDER BY fv.SubmittedAt ASC`
+    const [result] = await conn.query(
+      `INSERT INTO FreelancerVerifications (UserID, CategoryID, CustomSpeciality, Status, SubmittedAt)
+       VALUES (?, ?, ?, 'Pending', NOW())`,
+      [userId, categoryId, customText || null]
     );
-    res.json({ success: true, pending });
-  } catch (err) {
-    res.status(500).json({ success: false, message: `Could not load pending: ${err.message}` });
-  }
-});
+    const verificationId = result.insertId;
 
-// ── PUT /api/verification/:userId/review — admin approves or rejects ──
-router.put('/:userId/review', requireAuth, checkRole('Admin'), async (req, res) => {
-  try {
-    const { decision, notes, backgroundCheckStatus } = req.body;
-    // decision: 'Approved' or 'Rejected'
-    if (!['Approved', 'Rejected'].includes(decision))
-      return res.status(400).json({ success: false, message: 'Decision must be Approved or Rejected.' });
+    for (const f of files) {
+      const storageKey = `verifications/${crypto.randomUUID()}.${f.type.ext}`;
+      uploadedKeys.push(storageKey);   // recorded first so a partial upload is still cleaned up
+      await storage.uploadObject(storageKey, f.file.buffer, f.type.mime);
+      await conn.query(
+        `INSERT INTO VerificationDocuments
+          (VerificationID, Kind, StorageKey, OriginalName, MimeType, SizeBytes)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [verificationId, f.kind, storageKey, safeFileName(f.file.originalname, f.type.ext), f.type.mime, f.file.size]
+      );
+    }
 
-    await db.query(
-      `UPDATE FreelancerVerifications
-       SET Status=?, AdminNotes=?, ReviewedAt=NOW()
-       WHERE UserID=?`,
-      [decision, notes || '', req.params.userId]
-    );
+    if (role === 'Freelancer')
+      await conn.query("UPDATE Freelancers SET VerificationStatus='Pending' WHERE UserID=?", [userId]);
 
-    await db.query(
-      `UPDATE Freelancers
-       SET VerificationStatus=?, BackgroundCheckStatus=?
-       WHERE UserID=?`,
-      [
-        decision === 'Approved' ? 'Verified' : 'Rejected',
-        backgroundCheckStatus || 'Not Started',
-        req.params.userId
-      ]
-    );
+    await conn.commit();
+    committed = true;
 
-    res.json({
+    const [rows] = await db.query(`${RECORD_SQL} WHERE fv.VerificationID=?`, [verificationId]);
+    res.status(201).json({
       success: true,
-      message: `Freelancer verification ${decision.toLowerCase()}.`
+      message: 'Your verification was submitted and is now awaiting review.',
+      verification: toRecord(rows[0])
     });
-
   } catch (err) {
-    res.status(500).json({ success: false, message: `Could not process review: ${err.message}` });
+    console.error('VERIFICATION SUBMIT ERROR:', err.message);
+    if (!committed) {
+      if (conn) await conn.rollback().catch(() => {});
+      await storage.deleteObjects(uploadedKeys).catch(e =>
+        console.error('ORPHANED VERIFICATION FILES:', uploadedKeys.join(', '), e.message));
+    }
+    if (!res.headersSent)
+      res.status(500).json({ success: false, message: 'Could not submit your verification. Please try again.' });
+  } finally {
+    if (conn) conn.release();
   }
 });
 
-module.exports = router;
+// ── ADMIN ─────────────────────────────────────────────────
+adminRouter.use(requireSession, checkRole('Admin'));
+
+// GET /api/admin/verifications — all submissions; the dashboard filters by status itself
+adminRouter.get('/', async (req, res) => {
+  try {
+    const [rows] = await db.query(`${RECORD_SQL} ORDER BY fv.SubmittedAt DESC, fv.VerificationID DESC`);
+    res.json({ success: true, verifications: rows.map(toRecord) });
+  } catch (err) {
+    console.error('VERIFICATION LIST ERROR:', err.message);
+    res.status(500).json({ success: false, message: 'Could not load verifications.' });
+  }
+});
+
+// GET /api/admin/verifications/:verificationId/documents/:kind
+// Streams the private file through the backend so window.open() can display it.
+const DOCUMENT_KINDS = { identity: 'Identity', qualification: 'Qualification' };
+
+adminRouter.get('/:verificationId/documents/:kind', async (req, res) => {
+  const kind = DOCUMENT_KINDS[req.params.kind];
+  if (!kind) return res.status(404).json({ success: false, message: 'Document not found.' });
+  try {
+    const [docs] = await db.query(
+      'SELECT StorageKey, OriginalName, MimeType FROM VerificationDocuments WHERE VerificationID=? AND Kind=?',
+      [req.params.verificationId, kind]
+    );
+    if (!docs.length) return res.status(404).json({ success: false, message: 'Document not found.' });
+
+    const file = await storage.downloadObject(docs[0].StorageKey);
+    res.set({
+      'Content-Type':           docs[0].MimeType,
+      'Content-Disposition':    `inline; filename="${docs[0].OriginalName}"`,
+      'Cache-Control':          'private, no-store',
+      'X-Content-Type-Options': 'nosniff'
+    });
+    res.send(file);
+  } catch (err) {
+    console.error('VERIFICATION DOCUMENT ERROR:', err.message);
+    res.status(500).json({ success: false, message: 'Could not load the document.' });
+  }
+});
+
+// PUT /api/admin/verifications/:verificationId/status — { status, reason }
+adminRouter.put('/:verificationId/status', async (req, res) => {
+  const { status } = req.body;
+  const reason = String(req.body.reason ?? '').trim();
+  if (!['Approved', 'Rejected'].includes(status))
+    return res.status(400).json({ success: false, message: 'Status must be Approved or Rejected.' });
+  if (status === 'Rejected' && (reason.length < 3 || reason.length > 500))
+    return res.status(400).json({ success: false, message: 'A rejection reason (3-500 characters) is required.' });
+
+  let conn;
+  try {
+    conn = await db.getConnection();
+    await conn.beginTransaction();
+
+    const [rows] = await conn.query(
+      `SELECT fv.VerificationID, fv.UserID, fv.Status, fv.CustomSpeciality, c.CategoryName, u.Role,
+              EXISTS(SELECT 1 FROM VerificationDocuments d
+                     WHERE d.VerificationID = fv.VerificationID AND d.Kind = 'Identity') AS HasIdentity
+       FROM FreelancerVerifications fv
+       JOIN Users u ON u.UserID = fv.UserID
+       LEFT JOIN Categories c ON c.CategoryID = fv.CategoryID
+       WHERE fv.VerificationID=? FOR UPDATE`,
+      [req.params.verificationId]
+    );
+    const v = rows[0];
+    let refusal = null;
+    if (!v) refusal = [404, 'Verification not found.'];
+    else if (v.Status !== 'Pending') refusal = [409, 'Only pending submissions can be reviewed.'];
+    else if (status === 'Approved' && !v.HasIdentity)
+      refusal = [409, 'This submission has no identity document on record and cannot be approved. Reject it with a reason so the user can resubmit.'];
+    if (refusal) {
+      await conn.rollback();
+      return res.status(refusal[0]).json({ success: false, message: refusal[1] });
+    }
+
+    await conn.query(
+      `UPDATE FreelancerVerifications
+       SET Status=?, RejectionReason=?, ReviewedAt=NOW(), ReviewedBy=?
+       WHERE VerificationID=?`,
+      [status, status === 'Rejected' ? reason : null, req.session.user.id, v.VerificationID]
+    );
+
+    // Customer submissions never touch freelancer profile fields.
+    // A freelancer's speciality only changes when the submission is approved.
+    if (v.Role === 'Freelancer') {
+      const speciality = v.CustomSpeciality || v.CategoryName;
+      if (status === 'Approved' && speciality)
+        await conn.query(
+          "UPDATE Freelancers SET VerificationStatus='Verified', SkillCategory=? WHERE UserID=?",
+          [speciality, v.UserID]
+        );
+      else
+        await conn.query(
+          'UPDATE Freelancers SET VerificationStatus=? WHERE UserID=?',
+          [status === 'Approved' ? 'Verified' : 'Rejected', v.UserID]
+        );
+    }
+
+    await conn.commit();
+    res.json({ success: true, message: `Submission ${status.toLowerCase()}.` });
+  } catch (err) {
+    if (conn) await conn.rollback().catch(() => {});
+    console.error('VERIFICATION REVIEW ERROR:', err.message);
+    res.status(500).json({ success: false, message: 'Could not update the submission.' });
+  } finally {
+    if (conn) conn.release();
+  }
+});
+
+module.exports = { router, adminRouter };
