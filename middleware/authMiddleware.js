@@ -1,38 +1,12 @@
-const db = require('../config/db');
-
-async function requireAuth(req, res, next) {
-  // Check session first
+// Only a server-side session created by a real login (email/password or Google) is accepted.
+// Client-supplied identity headers such as x-user-id are never trusted.
+function requireAuth(req, res, next) {
   if (req.session?.user) return next();
-
-  // Fall back to x-user-id header (for cross-domain localStorage users)
-  const userId = req.headers['x-user-id'];
-  if (userId) {
-    try {
-      const [users] = await db.query(
-        'SELECT UserID, FullName, Email, Role, RefNumber FROM Users WHERE UserID = ? AND IsActive = 1',
-        [userId]
-      );
-      if (users.length) {
-        req.session.user = {
-          id:        users[0].UserID,
-          name:      users[0].FullName,
-          email:     users[0].Email,
-          role:      users[0].Role,
-          refNumber: users[0].RefNumber,
-          authSource: 'header'   // unverified — rejected by requireSession
-        };
-        return next();
-      }
-    } catch (err) {
-      console.error('Auth header check failed:', err.message);
-    }
-  }
-
   return res.status(401).json({ success: false, message: 'Please log in to continue.' });
 }
 
-// Stricter than requireAuth: only a session created by a real login is accepted.
-// The x-user-id header, and any session it created, is never trusted here.
+// Used by the verification routes. Also refuses any session still tagged by the
+// retired x-user-id fallback (authSource 'header'), e.g. one created before this deploy.
 function requireSession(req, res, next) {
   const user = req.session?.user;
   if (user && user.authSource !== 'header') return next();
