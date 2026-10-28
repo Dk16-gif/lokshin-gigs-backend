@@ -46,17 +46,41 @@ CREATE TABLE IF NOT EXISTS Freelancers (
 CREATE TABLE IF NOT EXISTS FreelancerVerifications (
   VerificationID  INT AUTO_INCREMENT PRIMARY KEY,
   UserID          INT NOT NULL,
-  IDNumber        VARCHAR(20) NOT NULL,
-  IDType          ENUM('SA ID','Passport','Drivers Licence') NOT NULL,
+  CategoryID      INT NULL,
+  CustomSpeciality VARCHAR(80) NULL,
+  IDNumber        VARCHAR(20) NULL,
+  IDType          ENUM('SA ID','Passport','Drivers Licence') NULL,
   ProofOfAddress  TEXT,
   Certifications  JSON,
   YearsExperience INT DEFAULT 0,
   Status          ENUM('Pending','Approved','Rejected') DEFAULT 'Pending',
   AdminNotes      TEXT,
+  RejectionReason VARCHAR(500) NULL,
   SubmittedAt     DATETIME DEFAULT CURRENT_TIMESTAMP,
   ReviewedAt      DATETIME DEFAULT NULL,
-  FOREIGN KEY (UserID) REFERENCES Users(UserID) ON DELETE CASCADE
+  ReviewedBy      INT NULL,
+  INDEX idx_fv_user_status (UserID, Status),
+  FOREIGN KEY (UserID) REFERENCES Users(UserID) ON DELETE CASCADE,
+  CONSTRAINT fk_fv_category FOREIGN KEY (CategoryID) REFERENCES Categories(CategoryID),
+  CONSTRAINT fk_fv_reviewer FOREIGN KEY (ReviewedBy) REFERENCES Users(UserID) ON DELETE SET NULL
 );
+
+-- ── VERIFICATION DOCUMENTS (bytes live in private object storage) ──
+-- MySQL 5.5-compatible: TIMESTAMP default, ASCII StorageKey keeps its unique key within 767 bytes.
+CREATE TABLE IF NOT EXISTS VerificationDocuments (
+  DocumentID     INT AUTO_INCREMENT PRIMARY KEY,
+  VerificationID INT NOT NULL,
+  Kind           ENUM('Identity','Qualification') NOT NULL,
+  StorageKey     VARCHAR(255) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  OriginalName   VARCHAR(255) NOT NULL,
+  MimeType       VARCHAR(100) NOT NULL,
+  SizeBytes      INT UNSIGNED NOT NULL,
+  UploadedAt     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_vd_storage_key (StorageKey),
+  UNIQUE KEY uq_vd_verification_kind (VerificationID, Kind),
+  CONSTRAINT fk_vd_verification FOREIGN KEY (VerificationID)
+    REFERENCES FreelancerVerifications(VerificationID) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- ── JOBS ──────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS Jobs (

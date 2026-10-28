@@ -73,10 +73,13 @@ node server.js
 ### Verification
 | Method | Endpoint | Description |
 |---|---|---|
-| POST | /api/verification/submit | Freelancer submits ID documents |
-| GET  | /api/verification/status | Freelancer checks their status |
-| GET  | /api/verification/pending | Admin views pending submissions |
-| PUT  | /api/verification/:userId/review | Admin approves or rejects |
+| GET  | /api/verifications/me | Current user's latest verification (`null` = Not Submitted) |
+| POST | /api/verifications | Multipart: `identityDocument` (required); Freelancers may add `qualificationDocument`, `categoryId` or `customSpeciality` |
+| GET  | /api/admin/verifications | Admin lists all submissions |
+| GET  | /api/admin/verifications/:verificationId/documents/:kind | Admin views a private document (`identity` or `qualification`) |
+| PUT  | /api/admin/verifications/:verificationId/status | Admin approves, or rejects with a `reason` |
+
+These routes require a logged-in session (the `x-user-id` header is not accepted). Documents are stored in a private Supabase Storage bucket; see `.env.example`. The old singular `/api/verification/*` routes are retired (HTTP 410).
 
 ### Payments
 | Method | Endpoint | Description |
